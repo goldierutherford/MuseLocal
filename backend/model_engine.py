@@ -77,7 +77,7 @@ class ModelEngine:
             logger.warning("Forcing model load on CPU (may be slow).")
             base_model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
-                torch_dtype=torch.float32,
+                torch_dtype=torch.float16,
                 device_map="cpu",
                 low_cpu_mem_usage=True,
                 trust_remote_code=True
@@ -172,14 +172,64 @@ class ModelEngine:
         seconds_per_bar = 2.0  # 120 BPM baseline
         progression = self._build_harmonic_progression(bar_count, seconds_per_bar, style_meta)
 
-        # Attempt local LLM API generation
-        llm_success, generated_tracks = self._query_local_llm(prompt, instrument_roles, progression)
+        # Attempt local PyTorch LoRA model generation
+        chords_str = ", ".join([f"Bar {c['bar']}: {c['type']} on root {c['root']}" for c in progression])
         
+        full_inference_prompt = (
+            "<|im_start|>system\n"
+            "You are an expert AI MIDI composer and elite studio session musician.\n"
+            f"Your task is to generate a multi-track MIDI arrangement in raw JSON format for the following roles: {instrument_roles}.\n"
+            f"The progression chord map is: {chords_str}.\n"
+            "Represent the notes as a JSON object where keys are the exact instrument roles, and values are arrays of note objects:\n"
+            '{"role_name": [{"note": midi_pitch_integer, "start": start_seconds_float, "end": end_seconds_float, "velocity": velocity_integer}]}\n\n'
+            "Strict MIDI Pitch Rules:\n"
+            "- 'bassline' pitches must be in the C1-C3 range (MIDI values 24-48).\n"
+            "- 'lead' solo pitches must be in the C4-C6 range (MIDI values 60-84).\n"
+            "- 'counter-melody' chords/pads must be in the C3-C5 range (MIDI values 48-72).\n\n"
+            "Formatting Rules:\n"
+            "- All note 'start' and 'end' values must be positive floats representing absolute time in seconds.\n"
+            "- Do not overlap notes on the same track unless it is 'counter-melody' (which allows polyphonic chords).\n"
+            "- Output ONLY valid raw JSON. Do not write any markdown code wrappers (like ```json), introduction, or explanations.\n"
+            "<|im_end|>\n"
+            f"<|im_start|>user\nGenerate notes based on this creative style prompt: {prompt}\n<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+
+        raw_response = self._query_local_llm(full_inference_prompt)
+        
+        llm_success = False
+        generated_tracks = {}
+        if raw_response:
+            try:
+                cleaned_content = raw_response.strip()
+                if cleaned_content.startswith("```"):
+                    cleaned_content = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned_content)
+                    cleaned_content = re.sub(r"\s*```$", "", cleaned_content)
+                
+                parsed_tracks = json.loads(cleaned_content)
+                for role in instrument_roles:
+                    if role in parsed_tracks and isinstance(parsed_tracks[role], list):
+                        validated_notes = []
+                        for note in parsed_tracks[role]:
+                            if all(k in note for k in ["note", "start", "end", "velocity"]):
+                                validated_notes.append({
+                                    "note": int(note["note"]),
+                                    "start": float(note["start"]),
+                                    "end": float(note["end"]),
+                                    "velocity": int(note["velocity"])
+                                })
+                        generated_tracks[role] = validated_notes
+                    else:
+                        generated_tracks[role] = []
+                llm_success = True
+            except Exception as parse_err:
+                logger.error(f"Failed to parse or validate local PyTorch model output: {parse_err}. Raw output was: {raw_response}")
+
         if llm_success and generated_tracks:
-            logger.info("Successfully synthesized tracks utilizing local LLM API.")
+            logger.info("Successfully synthesized tracks utilizing local PyTorch LoRA model.")
             return {"status": "completed", "tracks": generated_tracks}
             
-        logger.info("Local LLM API offline or returned invalid payload. Utilizing high-fidelity algorithmic fallback.")
+        logger.info("Local PyTorch LoRA model returned invalid payload. Utilizing high-fidelity algorithmic fallback.")
         
         # High-fidelity algorithmic music theory fallback
         generated_data = {}
@@ -195,73 +245,35 @@ class ModelEngine:
 
         return {"status": "completed", "tracks": generated_data}
 
-    def _query_local_llm(self, prompt: str, roles: List[str], progression: List[Dict[str, Any]]) -> tuple[bool, Dict[str, Any]]:
-        """Queries Ollama to generate structured note events matching the harmonic context."""
-        chords_str = ", ".join([f"Bar {c['bar']}: {c['type']} on root {c['root']}" for c in progression])
-        
-        system_prompt = (
-            "You are an expert AI MIDI composer and elite studio session musician.\n"
-            f"Your task is to generate a multi-track MIDI arrangement in raw JSON format for the following roles: {roles}.\n"
-            f"The progression chord map is: {chords_str}.\n"
-            "Represent the notes as a JSON object where keys are the exact instrument roles, and values are arrays of note objects:\n"
-            '{"role_name": [{"note": midi_pitch_integer, "start": start_seconds_float, "end": end_seconds_float, "velocity": velocity_integer}]}\n\n'
-            "Strict MIDI Pitch Rules:\n"
-            "- 'bassline' pitches must be in the C1-C3 range (MIDI values 24-48).\n"
-            "- 'lead' solo pitches must be in the C4-C6 range (MIDI values 60-84).\n"
-            "- 'counter-melody' chords/pads must be in the C3-C5 range (MIDI values 48-72).\n\n"
-            "Formatting Rules:\n"
-            "- All note 'start' and 'end' values must be positive floats representing absolute time in seconds.\n"
-            "- Do not overlap notes on the same track unless it is 'counter-melody' (which allows polyphonic chords).\n"
-            "- Output ONLY valid raw JSON. Do not write any markdown code wrappers (like ```json), introduction, or explanations."
-        )
-
-        url = f"{self.base_url}/chat/completions"
+    def _query_local_llm(self, prompt: str) -> str:
+        """Queries the loaded local PyTorch LoRA model directly."""
         try:
-            logger.info(f"Attempting API route to local Ollama endpoint: {url}")
-            response = httpx.post(
-                url,
-                json={
-                    "model": self.model_name,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Generate notes based on this creative style prompt: {prompt}"}
-                    ],
-                    "temperature": 0.5,
-                    "response_format": {"type": "json_object"}
-                },
-                timeout=8.0
+            if not getattr(self, 'model', None) or not getattr(self, 'tokenizer', None):
+                print("Model or tokenizer not loaded in memory!")
+                return ""
+
+            print("Starting PyTorch inference with custom LoRA...")
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=1500,
+                temperature=0.7,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id
             )
+
+            # Decode only the newly generated tokens
+            input_length = inputs.input_ids.shape[1]
+            generated_tokens = outputs[0][input_length:]
+            response_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
             
-            if response.status_code == 200:
-                raw_content = response.json()["choices"][0]["message"]["content"].strip()
-                # Clean markdown wrappers if returned despite system prompt instructions
-                if raw_content.startswith("```"):
-                    raw_content = re.sub(r"^```[a-zA-Z]*\s*", "", raw_content)
-                    raw_content = re.sub(r"\s*```$", "", raw_content)
-                
-                parsed_tracks = json.loads(raw_content)
-                # Simple structure validation
-                validated_tracks = {}
-                for role in roles:
-                    if role in parsed_tracks and isinstance(parsed_tracks[role], list):
-                        validated_notes = []
-                        for note in parsed_tracks[role]:
-                            if all(k in note for k in ["note", "start", "end", "velocity"]):
-                                validated_notes.append({
-                                    "note": int(note["note"]),
-                                    "start": float(note["start"]),
-                                    "end": float(note["end"]),
-                                    "velocity": int(note["velocity"])
-                                })
-                        validated_tracks[role] = validated_notes
-                    else:
-                        validated_tracks[role] = []
-                
-                return True, validated_tracks
+            print("Inference complete. Response received.")
+            return response_text
+
         except Exception as e:
-            logger.warning(f"Failed to query Ollama at {url}: {e}")
-            
-        return False, {}
+            print(f"PyTorch Inference Error: {e}")
+            return ""
 
     def _build_harmonic_progression(self, bar_count: int, seconds_per_bar: float, style: Dict[str, bool]) -> List[Dict[str, Any]]:
         """Compiles sophisticated extended chord maps including root, type, and specific jazz/latin extensions."""
